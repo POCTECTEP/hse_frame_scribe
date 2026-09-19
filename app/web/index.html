@@ -53,12 +53,14 @@
     <span class="st" id="st-asr"><i></i><span>…</span></span>
     <span class="st" id="st-vlm"><i></i><span>…</span></span>
     <span class="st" id="st-llm"><i></i><span>…</span></span>
+    <span class="st" id="st-provider"><i></i><span>…</span></span>
   </div>
 
   <nav class="tabs" aria-label="Разделы">
     <button class="tab active" data-tab="processor">Обработчик</button>
     <button class="tab" data-tab="records">Мои записи</button>
     <button class="tab" data-tab="settings">Настройки моделей</button>
+    <button class="tab" data-tab="config">Настройки провайдера</button>
   </nav>
 
   <section class="panel" id="panel-processor">
@@ -83,9 +85,40 @@
 
   <section class="panel hidden" id="panel-settings">
     <h2>Модели обработки</h2>
-    <p class="empty">Сначала скачай нужные модели. Применить можно только полностью скачанный набор.</p>
     <div class="model-settings" id="model-settings"><div class="empty">Загрузка списка моделей…</div></div>
     <div class="settings-actions"><button class="primary" id="save-models">Применить модели</button><span class="settings-message" id="model-message"></span></div>
+  </section>
+
+  <section class="panel hidden" id="panel-config">
+    <h2>Настройки провайдера</h2>
+    <div class="model-settings">
+      <div class="model">
+        <h3>Провайдер LLM/VLM</h3>
+        <div class="model-row">
+          <select id="provider-select">
+            <option value="ollama">Ollama</option>
+            <option value="lmstudio">LM Studio</option>
+          </select>
+        </div>
+        <p style="margin-top:8px;font-size:12px;color:var(--muted)">Выберите, какой сервер локальных моделей использовать. Ollama и LM Studio работают параллельно — просто выберите нужный.</p>
+      </div>
+      <div class="model">
+        <h3>Ollama URL</h3>
+        <div class="model-row">
+          <input type="text" id="ollama-url-input" placeholder="http://127.0.0.1:11434" style="min-width:0;background:#0b0d11;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:7px 8px;font:12px inherit;">
+        </div>
+      </div>
+      <div class="model">
+        <h3>LM Studio URL</h3>
+        <div class="model-row">
+          <input type="text" id="lmstudio-url-input" placeholder="http://127.0.0.1:1234" style="min-width:0;background:#0b0d11;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:7px 8px;font:12px inherit;">
+        </div>
+      </div>
+    </div>
+    <div class="settings-actions">
+      <button class="primary" id="save-config">Сохранить настройки</button>
+      <span class="settings-message" id="config-message"></span>
+    </div>
   </section>
 
   <div id="logbox" class="hidden" style="margin-top:26px"><h2>Лог</h2><pre class="log" id="logtext"></pre></div>
@@ -116,9 +149,14 @@ function renderStatus(h) {
   for (const [id, key, what] of [['st-vlm','vlm','VLM'], ['st-llm','llm','LLM']]) {
     const m = h[key] || {};
     st(id, m.status === 'ok' ? 'ok' : m.status === 'missing' ? 'err' : '',
-       m.status === 'ok' ? `${what} · ${m.model}` : m.status === 'missing' ? `${what} · модель не скачана` : `${what} · Ollama недоступна`,
-       m.status === 'ok' ? 'Модель загружена в Ollama' : m.status === 'missing' ? `Модель ${m.model} ещё не скачана` : `Ollama не отвечает по ${h.ollama_url || 'адресу'}`);
+       m.status === 'ok' ? `${what} · ${m.model}` : m.status === 'missing' ? `${what} · модель не скачана` : `${what} · ${h.provider === 'lmstudio' ? 'LM Studio' : 'Ollama'} недоступна`,
+       m.status === 'ok' ? `Модель ${m.model} загружена в ${h.provider === 'lmstudio' ? 'LM Studio' : 'Ollama'}` : m.status === 'missing' ? `Модель ${m.model} ещё не скачана` : `${h.provider === 'lmstudio' ? 'LM Studio' : 'Ollama'} не отвечает по ${h[h.provider === 'lmstudio' ? 'lmstudio_url' : 'ollama_url'] || 'адресу'}`);
   }
+  const provider = h.provider || 'ollama';
+  const providerUrl = provider === 'lmstudio' ? h.lmstudio_url : h.ollama_url;
+  st('st-provider', provider === 'lmstudio' ? (h.lmstudio_available ? 'ok' : 'err') : (h.ollama_available ? 'ok' : 'err'),
+     `${provider === 'lmstudio' ? 'LM Studio' : 'Ollama'} · ${providerUrl || '—'}`,
+     provider === 'lmstudio' ? (h.lmstudio_available ? 'LM Studio работает' : 'LM Studio не запущен') : (h.ollama_available ? 'Ollama работает' : 'Ollama не запущена'));
 }
 
 document.querySelectorAll('.tab').forEach(tab => tab.onclick = () => {
@@ -126,6 +164,7 @@ document.querySelectorAll('.tab').forEach(tab => tab.onclick = () => {
   document.querySelectorAll('.panel').forEach(x => x.classList.toggle('hidden', x.id !== `panel-${tab.dataset.tab}`));
   history.replaceState(null, '', `#${tab.dataset.tab}`);
   if (tab.dataset.tab === 'settings') refreshModels();
+  if (tab.dataset.tab === 'config') refreshConfig();
 });
 const _initTab = location.hash.replace('#', '');
 if (_initTab && document.querySelector(`.tab[data-tab="${_initTab}"]`)) document.querySelector(`.tab[data-tab="${_initTab}"]`).click();
@@ -252,7 +291,7 @@ async function refresh() {
     const [jobs, health] = await Promise.all([fetch('/api/jobs').then(r=>r.json()), fetch('/api/health').then(r=>r.json())]);
     healthData = health;
     renderStatus(health);
-    $('footer').textContent = `Очередь: ${health.queued} · Ollama: ${health.ollama_url || '—'}`;
+    $('footer').textContent = `Очередь: ${health.queued} · ${health.provider === 'lmstudio' ? 'LM Studio' : 'Ollama'}: ${health[health.provider === 'lmstudio' ? 'lmstudio_url' : 'ollama_url'] || '—'}`;
     render(processorJobs, jobs.filter(j => j.status !== 'done'), 'Загрузи видео, затем нажми «Запустить».');
     render(recordsJobs, jobs.filter(j => j.status === 'done'), 'Готовых материалов пока нет.', true);
     const anyActive = jobs.some(j => j.status === 'running' || j.status === 'queued');
@@ -261,6 +300,34 @@ async function refresh() {
   } catch (e) { /* сервер недоступен — повторит интервал */ }
 }
 async function showLog(id) { $('logbox').classList.remove('hidden'); const r = await fetch(`/api/jobs/${id}/log`); $('logtext').textContent = await r.text(); $('logtext').scrollTop = $('logtext').scrollHeight; }
+
+async function refreshConfig() {
+  try {
+    const r = await fetch('/api/settings/provider');
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || r.statusText);
+    $('provider-select').value = data.provider;
+    $('ollama-url-input').value = data.ollama_url;
+    $('lmstudio-url-input').value = data.lmstudio_url;
+  } catch (e) { $('config-message').textContent = 'Ошибка: ' + e.message; }
+}
+
+$('save-config').onclick = async () => {
+  const payload = {
+    provider: $('provider-select').value,
+    ollama_url: $('ollama-url-input').value,
+    lmstudio_url: $('lmstudio-url-input').value,
+  };
+  try {
+    const r = await fetch('/api/settings/provider', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    $('config-message').textContent = 'Настройки провайдера сохранены. Перезапустите приложение для применения.';
+    setTimeout(() => { $('config-message').textContent = ''; }, 3000);
+    refresh();
+  } catch (e) { $('config-message').textContent = 'Ошибка: ' + e.message; }
+};
+
 refresh(); setInterval(refresh, 15000);
 refreshModels();
 </script>
