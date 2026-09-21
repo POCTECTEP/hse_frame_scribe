@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE / "pipeline"))
 
-from common import ROOT, VIDEO_EXTS, load_config, sanitize, setup_logging  # noqa: E402
+from common import ROOT, VIDEO_EXTS, load_config, sanitize, setup_logging, CONFIG_PATH  # noqa: E402
 from main import extract_audio_track, process_video  # noqa: E402
 
 app = FastAPI(title="VideoNotes")
@@ -120,6 +120,27 @@ def _ollama_models(url: str) -> tuple[bool, list[dict]]:
         return False, []
 
 
+def _lmstudio_tags(url: str) -> tuple[bool, set[str]]:
+    """(LM Studio доступен?, множество имён моделей)."""
+    try:
+        import requests
+        r = requests.get(f"{url.rstrip('/')}/v1/models", timeout=5)
+        r.raise_for_status()
+        return True, {m.get("id", "") for m in r.json().get("data", [])}
+    except Exception:
+        return False, set()
+
+
+def _lmstudio_models(url: str) -> tuple[bool, list[dict]]:
+    try:
+        import requests
+        response = requests.get(f"{url.rstrip('/')}/v1/models", timeout=5)
+        response.raise_for_status()
+        return True, response.json().get("data", [])
+    except Exception:
+        return False, []
+
+
 def _model_present(need: str, present: set[str]) -> bool:
     if not need:
         return False
@@ -167,19 +188,34 @@ def _gpu_info() -> dict:
 
 
 def _log_ollama_status() -> None:
-    """Старт: показать состояние Ollama, не блокируя сервис."""
-    url = cfg["llm"].get("ollama_url", "").rstrip("/")
-    ok, present = _ollama_tags(url)
-    if not ok:
-        log.warning("Ollama пока недоступна (%s)", url)
-        return
-    missing = [n for n in sorted({cfg["llm"].get("vlm_model"), cfg["llm"].get("llm_model")})
-               if not _model_present(n, present)]
-    log.info("Ollama доступна: %s | модели: %s", url, ", ".join(sorted(present)) or "(нет)")
-    if missing:
-        log.warning("Выбранные модели ещё не скачаны: %s", ", ".join(missing))
+    """Старт: показать состояние провайдера LLM, не блокируя сервис."""
+    provider = cfg.get("llm", {}).get("provider", "ollama")
+    if provider == "ollama":
+        url = cfg["llm"].get("ollama_url", "").rstrip("/")
+        ok, present = _ollama_tags(url)
+        if not ok:
+            log.warning("Ollama пока недоступна (%s)", url)
+            return
+        missing = [n for n in sorted({cfg["llm"].get("vlm_model"), cfg["llm"].get("llm_model")})
+                   if not _model_present(n, present)]
+        log.info("Ollama доступна: %s | модели: %s", url, ", ".join(sorted(present)) or "(нет)")
+        if missing:
+            log.warning("Выбранные модели ещё не скачаны: %s", ", ".join(missing))
+        else:
+            log.info("Все нужные модели на месте")
     else:
-        log.info("Все нужные модели на месте")
+        url = cfg["llm"].get("lmstudio_url", "").rstrip("/")
+        ok, present = _lmstudio_tags(url)
+        if not ok:
+            log.warning("LM Studio пока недоступна (%s)", url)
+            return
+        missing = [n for n in sorted({cfg["llm"].get("vlm_model"), cfg["llm"].get("llm_model")})
+                   if not _model_present(n, present)]
+        log.info("LM Studio доступна: %s | модели: %s", url, ", ".join(sorted(present)) or "(нет)")
+        if missing:
+            log.warning("Выбранные модели ещё не скачаны: %s", ", ".join(missing))
+        else:
+            log.info("Все нужные модели на месте")
 
 
 _log_ollama_status()
@@ -249,6 +285,7 @@ def _start_model_pull(role: str, model: str) -> dict:
 
 
 def _pull_model(operation_id: str) -> None:
+    import requests
     operation = MODEL_PULLS[operation_id]
     operation["status"] = "downloading"
     try:
@@ -260,21 +297,25 @@ def _pull_model(operation_id: str) -> None:
             asr.load()
             asr.unload()
         else:
-            import requests
-            response = requests.post(
-                f"{cfg['llm']['ollama_url'].rstrip('/')}/api/pull",
-                json={"model": operation["model"], "stream": True}, stream=True, timeout=(5, None),
-            )
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                update = json.loads(line)
-                operation["detail"] = update.get("status", operation["detail"])
-                operation["completed"] = update.get("completed", operation["completed"])
-                operation["total"] = update.get("total", operation["total"])
-                if update.get("error"):
-                    raise RuntimeError(update["error"])
+            provider = cfg.get("llm", {}).get("provider", "ollama")
+            if provider == "ollama":
+                response = requests.post(
+                    f"{cfg['llm']['ollama_url'].rstrip('/')}/api/pull",
+                    json={"model": operation["model"], "stream": True}, stream=True, timeout=(5, None),
+                )
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    update = json.loads(line)
+                    operation["detail"] = update.get("status", operation["detail"])
+                    operation["completed"] = update.get("completed", operation["completed"])
+                    operation["total"] = update.get("total", operation["total"])
+                    if update.get("error"):
+                        raise RuntimeError(update["error"])
+            else:
+                # LM Studio не поддерживает pull через API — модели скачиваются вручную
+                raise RuntimeError("LM Studio не поддерживает автоматическое скачивание моделей. Скачайте модель вручную через интерфейс LM Studio.")
         operation["status"] = "success"
     except Exception as error:  # noqa: BLE001
         operation["status"] = "error"
@@ -289,14 +330,22 @@ def _job_config(job: dict) -> dict:
 
 
 def _missing_model_roles(settings: dict) -> list[str]:
+    provider = cfg.get("llm", {}).get("provider", "ollama")
     ollama_ok, present = _ollama_tags(cfg["llm"].get("ollama_url", ""))
+    lmstudio_ok, lm_present = _lmstudio_tags(cfg["llm"].get("lmstudio_url", ""))
     missing = []
     if _asr_status(settings["asr_model"]) != "ok":
         missing.append("ASR")
-    if not ollama_ok or not _model_present(settings["vlm_model"], present):
-        missing.append("VLM")
-    if not ollama_ok or not _model_present(settings["llm_model"], present):
-        missing.append("LLM")
+    if provider == "ollama":
+        if not ollama_ok or not _model_present(settings["vlm_model"], present):
+            missing.append("VLM")
+        if not ollama_ok or not _model_present(settings["llm_model"], present):
+            missing.append("LLM")
+    else:
+        if not lmstudio_ok or not _model_present(settings["vlm_model"], lm_present):
+            missing.append("VLM")
+        if not lmstudio_ok or not _model_present(settings["llm_model"], lm_present):
+            missing.append("LLM")
     return missing
 
 
@@ -364,12 +413,28 @@ def index() -> str:
 @app.get("/api/health")
 def health() -> dict:
     """Статус стека для панели индикаторов: ASR-веса, VLM/LLM-модели, GPU/CPU."""
-    ollama_ok, present = _ollama_tags(cfg["llm"].get("ollama_url", ""))
+    provider = cfg.get("llm", {}).get("provider", "ollama")
+    ollama_ok = False
+    ollama_present = set()
+    lmstudio_ok = False
+    lmstudio_present = set()
+    
+    if provider == "ollama":
+        ollama_ok, ollama_present = _ollama_tags(cfg["llm"].get("ollama_url", ""))
+    else:
+        # Проверяем оба провайдера
+        ollama_ok, ollama_present = _ollama_tags(cfg["llm"].get("ollama_url", ""))
+        lmstudio_ok, lmstudio_present = _lmstudio_tags(cfg["llm"].get("lmstudio_url", ""))
 
     def _llm_status(model: str) -> str:
-        if not ollama_ok:
-            return "unavailable"
-        return "ok" if _model_present(model, present) else "missing"
+        if provider == "ollama":
+            if not ollama_ok:
+                return "unavailable"
+            return "ok" if _model_present(model, ollama_present) else "missing"
+        else:
+            if not lmstudio_ok:
+                return "unavailable"
+            return "ok" if _model_present(model, lmstudio_present) else "missing"
 
     return {
         "ok": True,
@@ -379,6 +444,8 @@ def health() -> dict:
         "llm": {"model": cfg["llm"].get("llm_model"), "status": _llm_status(cfg["llm"].get("llm_model", ""))},
         "gpu": _gpu_info(),
         "ollama_url": cfg["llm"].get("ollama_url"),
+        "lmstudio_url": cfg["llm"].get("lmstudio_url"),
+        "provider": provider,
         # Хостовый путь к папке конспектов (для UI: показывать путь на хосте, а не /app/output)
         "output_dir": os.environ.get("OUTPUT_HOST_DIR", ""),
     }
@@ -387,15 +454,27 @@ def health() -> dict:
 @app.get("/api/models")
 def models() -> dict:
     """Каталог, выбранные модели и состояние их загрузки."""
-    ollama_ok, local_models = _ollama_models(cfg["llm"].get("ollama_url", ""))
-    present = {model.get("name", "") for model in local_models}
+    provider = cfg.get("llm", {}).get("provider", "ollama")
+    ollama_ok = False
+    lmstudio_ok = False
+    
+    if provider == "ollama":
+        ollama_ok, local_models = _ollama_models(cfg["llm"].get("ollama_url", ""))
+        present = {model.get("name", "") for model in local_models}
+    else:
+        lmstudio_ok, local_models = _lmstudio_models(cfg["llm"].get("lmstudio_url", ""))
+        present = {model.get("name", "") for model in local_models}
+    
     with MODEL_LOCK:
         pulls = list(MODEL_PULLS.values())
     return {
         "catalog": MODEL_CATALOG,
         "settings": MODEL_SETTINGS,
-        "ollama_available": ollama_ok,
-        "ollama_models": local_models,
+        "ollama_available": ollama_ok if provider == "ollama" else False,
+        "ollama_models": local_models if provider == "ollama" else [],
+        "lmstudio_available": lmstudio_ok if provider != "ollama" else False,
+        "lmstudio_models": local_models if provider != "ollama" else [],
+        "provider": provider,
         "installed": {
             "asr": {name: _asr_status(name) for name in _catalog_names("asr")},
             "vlm": {name: _model_present(name, present) for name in _catalog_names("vlm")},
@@ -434,6 +513,38 @@ def save_models(payload: dict) -> dict:
     _apply_model_settings(cfg, MODEL_SETTINGS)
     _save_model_settings(MODEL_SETTINGS)
     return {"settings": MODEL_SETTINGS}
+
+
+@app.get("/api/settings/provider")
+def get_provider() -> dict:
+    """Текущие настройки провайдера."""
+    return {
+        "provider": cfg.get("llm", {}).get("provider", "ollama"),
+        "ollama_url": cfg["llm"].get("ollama_url", "http://127.0.0.1:11434"),
+        "lmstudio_url": cfg["llm"].get("lmstudio_url", "http://127.0.0.1:1234"),
+    }
+
+
+@app.put("/api/settings/provider")
+def save_provider(payload: dict) -> dict:
+    """Сохранить настройки провайдера."""
+    provider = str(payload.get("provider", "ollama"))
+    if provider not in {"ollama", "lmstudio"}:
+        raise HTTPException(400, f"Неизвестный провайдер: {provider}")
+    
+    cfg["llm"]["provider"] = provider
+    if "ollama_url" in payload:
+        cfg["llm"]["ollama_url"] = str(payload["ollama_url"])
+    if "lmstudio_url" in payload:
+        cfg["llm"]["lmstudio_url"] = str(payload["lmstudio_url"])
+    
+    # Сохраняем в файл, чтобы применялось при перезапуске
+    try:
+        CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass  # не блокируем сохранение, если файл недоступен
+    
+    return {"provider": provider, "ollama_url": cfg["llm"]["ollama_url"], "lmstudio_url": cfg["llm"]["lmstudio_url"]}
 
 
 @app.post("/api/upload")

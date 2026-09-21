@@ -26,8 +26,12 @@ def load_config() -> dict:
     # Переопределения через переменные окружения (Docker)
     if os.environ.get("OLLAMA_URL"):
         cfg.setdefault("llm", {})["ollama_url"] = os.environ["OLLAMA_URL"]
+    if os.environ.get("LMSTUDIO_URL"):
+        cfg.setdefault("llm", {})["lmstudio_url"] = os.environ["LMSTUDIO_URL"]
     if os.environ.get("ASR_DEVICE"):
         cfg.setdefault("asr", {})["device"] = os.environ["ASR_DEVICE"]
+    if os.environ.get("LLM_PROVIDER"):
+        cfg.setdefault("llm", {})["provider"] = os.environ["LLM_PROVIDER"]
     settings_file = ROOT / "runtime" / "tmp" / "model_settings.json"
     try:
         settings = json.loads(settings_file.read_text(encoding="utf-8"))

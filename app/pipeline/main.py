@@ -222,7 +222,10 @@ def selftest(cfg: dict, log) -> int:
     from vlm import make_llm
     llm = make_llm(cfg["llm"], log)
     if llm.available():
-        log.info("✓ Ollama доступна: %s", cfg["llm"].get("ollama_url"))
+        provider = cfg.get("llm", {}).get("provider", "ollama")
+        url = cfg["llm"].get("lmstudio_url" if provider == "lmstudio" else "ollama_url", "")
+        provider_name = "LM Studio" if provider == "lmstudio" else "Ollama"
+        log.info("✓ %s доступна: %s", provider_name, url)
         try:
             r = llm.chat("Ответь одним словом: тест")
             log.info("✓ LLM отвечает: %s", r[:60])
@@ -232,8 +235,11 @@ def selftest(cfg: dict, log) -> int:
         if cfg["llm"].get("provider") == "stub":
             log.info("✓ LLM: stub (тестовый режим)")
         else:
-            log.error("✗ Ollama недоступна по %s — запусти ollama serve",
-                      cfg["llm"].get("ollama_url")); ok = False
+            provider = cfg.get("llm", {}).get("provider", "ollama")
+            url = cfg["llm"].get("lmstudio_url" if provider == "lmstudio" else "ollama_url", "")
+            provider_name = "LM Studio" if provider == "lmstudio" else "Ollama"
+            log.error("✗ %s недоступна по %s — запусти %s",
+                      provider_name, url, provider_name if provider == "lmstudio" else "ollama serve")
 
     log.info("SELFTEST %s", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
